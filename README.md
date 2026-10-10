@@ -162,6 +162,3 @@ amounts of smoothing; it can also be applied iteratively to the same curve.
   the self-supervised result is compared. A genuinely clean reference cannot be measured in a
   time-resolved experiment; the smooth target is approximated by averaging consecutive frames of a
   static sample, which requires the sample to stay unchanged over the acquisition.
-
-Xuke Li — lixuke@nimte.ac.cn
-Ningbo Institute of Materials Technology and Engineering, Chinese Academy of Sciences
