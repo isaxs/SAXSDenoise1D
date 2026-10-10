@@ -1,9 +1,8 @@
 # Noise2Noise and Noise2Clean denoising for time-resolved 1D SAXS curves
 
-
-The repository contains the two networks used in the paper and the tools for training and applying them:
-a **self-supervised (Noise2Noise)** model that needs no clean reference, and a **supervised (Noise2Clean)**
-model that serves as a benchmark. Both operate on **one-dimensional SAXS curves** `I(q)` of variable length.
+Training and inference code for two denoising networks that operate on **one-dimensional SAXS curves**
+`I(q)` of variable length: a **self-supervised (Noise2Noise)** model that needs no clean reference, and a
+**supervised (Noise2Clean)** model that serves as a benchmark.
 
 ---
 
@@ -16,18 +15,18 @@ model that serves as a benchmark. Both operate on **one-dimensional SAXS curves*
 | `curve_smooth_NNAttention11_1.py` | Trains the supervised benchmark (`Noise2Clean`) |
 | `curve_smooth_test11_oneGUI.py` | GUI for denoising curves with the trained Noise2Clean model at a user-set denoising factor |
 
-The four scripts total about 4,000 lines: 1,404 (`N2N_curv_09-16_test.py`), 1,035
-(`curve_smooth_test11_oneGUI.py`), 969 (`curve_smooth_NNAttention11_1.py`) and 660
+The four scripts total about 4,200 lines: 1,404 (`N2N_curv_09-16_test.py`), 1,035
+(`curve_smooth_test11_oneGUI.py`), 1,029 (`curve_smooth_NNAttention11_1.py`) and 750
 (`N2N_curv_09_train.py`).
 
 ---
 
 ## Requirements
 
-Python 3.8 or later, with
+Python 3, with
 
 ```
-torch        >= 1.10   (CUDA optional; the paper used PyTorch 2.5.1)
+torch                  (tested with 2.5.1; CUDA optional)
 numpy
 pandas
 matplotlib
@@ -60,19 +59,25 @@ first is `q` and the second is the intensity:
 ...
 ```
 
-**Noise2Clean** (`curve_smooth_NNAttention11_1.py`) — four or more columns; the second column is the
-noisy curve and the fourth column is the smooth reference of the same curve:
+**Noise2Clean** (`curve_smooth_NNAttention11_1.py`) — four or more columns, taken from the paired
+`.dat` files written by the pairing script: the first column is the scattering vector, the second the
+noisy intensity, the third the scattering vector again, and the fourth the smooth reference intensity
+of the same curve.
 
 ```
-# # SmoothFactor: 16.0
-# batch_id   I_noisy   n_frames   I_smooth
-1            1.234     16         1.241
-1            1.198     16         1.205
+# Data from /raw/sample-name/series/curve-0001.dat
+# Smooth curve from /raw/sample-name/series/curve-last.dat
+# SmoothFactor: 16.0
+# Column1: q_data, Column2: I_data, Column3: q_smo, Column4: I_smo
+0.01000  1.234000  0.01000  1.241000
+0.01050  1.198000  0.01050  1.205000
 ...
 ```
 
-The optional `# # SmoothFactor:` header records the averaging factor `N` used to build the smooth
-reference; it is passed to the network as a conditioning input. If absent, 16.0 is assumed.
+Two header lines matter to the code. `# Data from` names the file the noisy curve was cut from; the
+folder it sits in identifies the **sample**, which is the unit the dataset is split on. `# SmoothFactor:`
+records the averaging factor `N` used to build the smooth reference and is passed to the network as a
+conditioning input; if the line is absent, 16.0 is assumed.
 
 ---
 
@@ -80,9 +85,11 @@ reference; it is passed to the network as a conditioning input. If absent, 16.0 
 
 ### 1. Self-supervised model (Noise2Noise)
 
-**Training.** Put the curve files into subfolders of `./Data/`, one subfolder per sample (the 50
+**Training.** Put the curve files into subfolders of `./Data/`, **one subfolder per sample** (the 50
 consecutive frames of a static sample belong in one subfolder — training pairs are drawn at random
-from within a subfolder). Then run
+from within a subfolder). The training / validation / test split is made **on the sample folders**,
+not on the pairs, so every frame of a given sample stays inside a single subset and the held-out
+loss is measured on samples the model has never seen. Then run
 
 ```bash
 python N2N_curv_09_train.py
@@ -90,13 +97,13 @@ python N2N_curv_09_train.py
 
 Key settings are at the top of the file, in `class Config`:
 
-| Setting | Value used in the paper |
+| Setting | Default value |
 |---|---|
 | `num_pairs` | 5400 |
 | `batch_size` | 1 (curves have variable length and are processed one at a time) |
 | `num_epochs` | 500 |
 | `learning_rate` | 1e-3 (Adam), cosine annealing to 1e-5 |
-| `val_split` | 0.25 |
+| split (train : val : test) | 70 : 15 : 15, fixed seed 42 |
 | loss | L1 |
 | early stopping | patience 100, min_delta 1e-6 |
 | preprocessing | `clip_negative = True`, `use_log1p = True` |
@@ -111,12 +118,12 @@ python N2N_curv_09-16_test.py
 ```
 
 and select a curve file in the GUI. The tool loads `./models/denoise_1d.pth`, denoises the curve, and
-reports the metrics used in the paper:
+reports:
 
 - first- and second-order difference norms (L1 and L2) of the raw and denoised curve, and their reductions;
 - the **balance ratio** *R*, defined as the reduction in second-order norm divided by the reduction in
   first-order norm. *R* > 1 means noise-like curvature is removed faster than signal-bearing gradient.
-  This is the reference-free metric introduced in the paper: it needs no clean reference measurement;
+  This is the reference-free metric: it needs no clean reference measurement;
 - the autocorrelation of the residuals, which should lie inside the 95 % confidence band at every
   non-zero lag.
 
@@ -132,11 +139,13 @@ python curve_smooth_NNAttention11_1.py
 ```
 
 Settings are at the top of the `if __name__ == "__main__":` block: `folder_path` (default
-`./curve_pairs`) and `use_log_coordinates` (default `True`). The data are split 70 : 15 : 15 with seed
-42; training uses batch size 32, 500 epochs, Adam at 5e-3 with weight decay 1e-5,
-`ReduceLROnPlateau` (factor 0.5, patience 5), and early stopping with patience 10. The objective
-combines mean-square and mean-absolute error with smoothness, attention-sparsity, peak-protection,
-edge and flat-region terms.
+`./curve_pairs`) and `use_log_coordinates` (default `True`). The split is again made **on the samples,
+not on the curve pairs**: the sample a pair belongs to is read back from the `# Data from <path>`
+header that the pairing script writes into each file, so all the pairs cut from one sample stay in a
+single subset. The ratio is 70 : 15 : 15 with seed 42. Training uses batch size 32, 500 epochs, Adam
+at 5e-3 with weight decay 1e-5, `ReduceLROnPlateau` (factor 0.5, patience 5), and early stopping with
+patience 10. The objective combines mean-square and mean-absolute error with smoothness,
+attention-sparsity, peak-protection, edge and flat-region terms.
 
 Outputs `best_smoothing_model_NN11_v2.pth` and `final_smoothing_model_NN11_v2.pth`.
 
@@ -156,7 +165,7 @@ amounts of smoothing; it can also be applied iteratively to the same curve.
 
 - **Noise2Noise** requires only that the noise of two frames of the same static sample be zero-mean and
   independent between the frames. It does **not** require the noise to follow any particular
-  distribution — the Poisson character is verified in the paper as a convenient, demanding test of
+  distribution — the Poisson character is checked here as a convenient, demanding test of
   those two conditions, not as a precondition of the method.
 - **Noise2Clean** exists in this repository only to provide the supervised upper bound against which
   the self-supervised result is compared. A genuinely clean reference cannot be measured in a
