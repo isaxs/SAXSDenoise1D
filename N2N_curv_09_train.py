@@ -25,7 +25,11 @@ class Config:
     batch_size = 1         # Batch size must be 1 for variable length
     num_epochs = 500        # Number of epochs
     learning_rate = 1e-3   # Initial learning rate
-    val_split = 0.25        # Validation split ratio
+    # Dataset split ratios, train : validation : test = 70 : 15 : 15,
+    # the same ratio used for the Noise2Clean benchmark
+    train_ratio = 0.70
+    val_ratio = 0.15
+    test_ratio = 0.15
     
     # Model saving
     model_save_path = "./models/denoise_1d.pth"  # Best model save path
@@ -96,17 +100,47 @@ def preprocess_data(data):
     
     return data
 
+# ==================== Sample-level splitting ====================
+def split_folders_by_sample(data_root, train_ratio, val_ratio, random_seed):
+    """Partition the sample folders into training, validation and test sets.
+
+    Each folder holds the consecutive frames of one static sample, so splitting
+    on folders rather than on pairs keeps every frame of a given sample inside a
+    single subset. The validation and test pairs then share no sample with the
+    training pairs, which is what makes the held-out loss an honest estimate of
+    the performance on an unseen sample.
+    """
+    folders = sorted([f for f in os.listdir(data_root)
+                      if os.path.isdir(os.path.join(data_root, f))])
+
+    rng = random.Random(random_seed)
+    rng.shuffle(folders)
+
+    total = len(folders)
+    n_train = int(train_ratio * total)
+    n_val = int(val_ratio * total)
+
+    return (folders[:n_train],
+            folders[n_train:n_train + n_val],
+            folders[n_train + n_val:])
+
+
 # ==================== Dataset Class ====================
 class FullCurveDataset(Dataset):
     """Dataset using full curves without cropping"""
-    
-    def __init__(self, data_root, num_pairs=500):
+
+    def __init__(self, data_root, num_pairs=500, folders=None):
         self.data_root = data_root
         self.num_pairs = num_pairs
-        
-        # Get all folders
-        self.folders = sorted([f for f in os.listdir(data_root) 
+
+        # Get all folders, or keep only the subset of samples passed in
+        all_folders = sorted([f for f in os.listdir(data_root)
                              if os.path.isdir(os.path.join(data_root, f))])
+        if folders is None:
+            self.folders = all_folders
+        else:
+            selected = set(folders)
+            self.folders = [f for f in all_folders if f in selected]
         
         # Collect all valid files
         self.folder_files = {}
@@ -131,8 +165,12 @@ class FullCurveDataset(Dataset):
         # Generate fixed number of pairs
         self.pairs = self._generate_pairs()
         print(f"Dataset initialized: {len(self.pairs)} pairs")
-        
+
         # Calculate statistics
+        if len(self.pairs) == 0:
+            print("Warning: no pairs could be generated from the assigned samples")
+            return
+
         lengths = [len(self.file_data[p[0]]) for p in self.pairs]
         print(f"Curve length range: {min(lengths)} to {max(lengths)} points")
         print(f"Average curve length: {np.mean(lengths):.0f} points")
@@ -414,31 +452,48 @@ def train_noise2noise():
     # Check data directory
     if not os.path.exists(config.data_root):
         print(f"Error: Data directory {config.data_root} does not exist!")
-        return None, None, None, None
+        return None, None, None, None, None
     
-    # Create single dataset with all pairs
+    # Split the samples (folders) into training, validation and test sets, so that
+    # no sample contributes frames to more than one subset
     try:
-        full_dataset = FullCurveDataset(config.data_root, num_pairs=config.num_pairs)
+        train_folders, val_folders, test_folders = split_folders_by_sample(
+            config.data_root, config.train_ratio, config.val_ratio, config.random_seed
+        )
+    except Exception as e:
+        print(f"Error listing samples: {e}")
+        return None, None, None, None, None
+
+    n_samples = len(train_folders) + len(val_folders) + len(test_folders)
+    if not (train_folders and val_folders and test_folders):
+        print(f"Error: {n_samples} samples are not enough to fill all three splits!")
+        return None, None, None, None, None
+
+    print(f"Samples (folders): {len(train_folders)} training, "
+          f"{len(val_folders)} validation, {len(test_folders)} test")
+
+    # One dataset per subset, each drawing its pairs only from its own samples
+    try:
+        train_dataset = FullCurveDataset(config.data_root,
+                                         num_pairs=int(config.num_pairs * config.train_ratio),
+                                         folders=train_folders)
+        val_dataset = FullCurveDataset(config.data_root,
+                                       num_pairs=int(config.num_pairs * config.val_ratio),
+                                       folders=val_folders)
+        test_dataset = FullCurveDataset(config.data_root,
+                                        num_pairs=int(config.num_pairs * config.test_ratio),
+                                        folders=test_folders)
     except Exception as e:
         print(f"Error creating dataset: {e}")
-        return None, None, None, None
-    
-    if len(full_dataset) == 0:
-        print("Error: Dataset is empty!")
-        return None, None, None, None
-    
-    print(f"Created dataset with {len(full_dataset)} pairs")
-    
-    # Split into train and validation
-    train_size = int((1 - config.val_split) * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
-    )
-    
+        return None, None, None, None, None
+
+    if len(train_dataset) == 0 or len(val_dataset) == 0 or len(test_dataset) == 0:
+        print("Error: one of the three splits contains no pairs!")
+        return None, None, None, None, None
+
     print(f"Training set: {len(train_dataset)} pairs")
     print(f"Validation set: {len(val_dataset)} pairs")
+    print(f"Test set: {len(test_dataset)} pairs")
     
     # Create data loaders with custom collate function
     train_loader = DataLoader(
@@ -451,6 +506,14 @@ def train_noise2noise():
     
     val_loader = DataLoader(
         val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=variable_length_collate
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -604,7 +667,12 @@ def train_noise2noise():
     print("-"*60)
     print(f"Training completed!")
     print(f"Best validation loss: {best_val_loss:.6f}")
-    
+
+    # Restore the weights selected on the validation set, so that what is returned
+    # and evaluated below is the selected model and not the last epoch
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
     # Save final model
     if best_model_state is not None:
         torch.save({
@@ -615,8 +683,27 @@ def train_noise2noise():
             'config': config.__dict__
         }, config.final_model_save_path)
         print(f"Final model saved to: {config.final_model_save_path}")
-    
-    return model, train_losses, val_losses, best_val_loss
+
+    # Evaluate the selected model on the held-out test set
+    model.eval()
+    epoch_test_loss = 0
+    test_batches = 0
+
+    with torch.no_grad():
+        for noisy1, noisy2 in test_loader:
+            noisy1 = noisy1.to(config.device)
+            noisy2 = noisy2.to(config.device)
+
+            denoised = model(noisy1)
+            loss = criterion(denoised, noisy2)
+
+            epoch_test_loss += loss.item()
+            test_batches += 1
+
+    test_loss = epoch_test_loss / test_batches if test_batches > 0 else 0
+    print(f"Test loss on {len(test_dataset)} held-out pairs: {test_loss:.6f}")
+
+    return model, train_losses, val_losses, best_val_loss, test_loss
 
 # ==================== Main Function ====================
 def main():
@@ -633,6 +720,7 @@ def main():
     print(f"Learning rate: {config.learning_rate}")
     print(f"Batch size: {config.batch_size} (for variable length)")
     print(f"Epochs: {config.num_epochs}")
+    print(f"Split (train:val:test): {config.train_ratio:.2f} : {config.val_ratio:.2f} : {config.test_ratio:.2f}")
     print(f"Clip negative values: {config.clip_negative}")
     print(f"Use log1p transform: {config.use_log1p}")
     print(f"Loss function: L1 Loss only")
@@ -654,6 +742,8 @@ def main():
     print("Training Completed!")
     print(f"Best model saved to: {config.model_save_path}")
     print(f"Final model saved to: {config.final_model_save_path}")
+    print(f"Best validation loss: {result[3]:.6f}")
+    print(f"Test loss: {result[4]:.6f}")
     print("="*60)
 
 # ==================== Run Main Program ====================

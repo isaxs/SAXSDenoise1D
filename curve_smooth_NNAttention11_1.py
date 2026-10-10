@@ -5,15 +5,40 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import re
+import random
 
 # Set device (automatically detect GPU)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+
+
+def extract_sample_id(file_path):
+    """Recover which sample a paired curve belongs to.
+
+    The pairing script records the source path in the header ('# Data from ...'),
+    and that path ends with the folder of the sample the curve was cut from, so
+    the sample can be read back from there. Files written without that header fall
+    back to the part of the file name before '_paired_with_'.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if line.startswith('# Data from'):
+                    source = line.split('from', 1)[1].strip()
+                    folder = os.path.basename(os.path.dirname(source))
+                    return folder if folder else source
+                if not line.startswith('#'):
+                    break
+    except OSError:
+        pass
+
+    name = os.path.basename(file_path)
+    return name.split('_paired_with_')[0]
 
 # 1. Custom Dataset Class - Modified to read SmoothFactor from headers and support log transformation
 class CurveDataset(Dataset):
@@ -33,6 +58,7 @@ class CurveDataset(Dataset):
         self.curves = []
         self.curve_lengths = []
         self.smooth_factors = []  # New: Store smooth factors from headers
+        self.samples = []         # New: Sample each curve belongs to, used for splitting
         
         print("Loading curve data...")
         for file_name in self.file_list:
@@ -81,6 +107,7 @@ class CurveDataset(Dataset):
                 self.curves.append((X_curve, y_curve))
                 self.curve_lengths.append(len(X_curve))
                 self.smooth_factors.append(smooth_factor)
+                self.samples.append(extract_sample_id(file_path))
                     
             except Exception as e:
                 # Silently handle errors, just skip the file
@@ -111,6 +138,11 @@ class CurveDataset(Dataset):
                 self.padded_curves.append((X_curve, y_curve))
         
         print(f"\nSuccessfully loaded and processed {len(self.padded_curves)} curves")
+        n_samples = len(set(self.samples))
+        print(f"Samples the curves come from: {n_samples}")
+        if n_samples == len(self.padded_curves):
+            print("Warning: every curve was treated as its own sample. Check that the paired files "
+                  "carry a '# Data from ...' header identifying their source folder.")
         print(f"Log coordinates: {self.use_log_coordinates}")
     
     def __len__(self):
@@ -511,34 +543,60 @@ class AdaptiveSmoothingNetV2(nn.Module):
 def create_data_splits(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_seed=42):
     """
     Split dataset into training, validation, and test sets
-    
+
+    The split is drawn on the samples, not on the curves: a single sample yields
+    many curve pairs, so splitting the curves at random would put curves of the
+    same sample on both sides of the split and make the held-out loss an
+    over-optimistic estimate. Assigning whole samples keeps every curve of a
+    sample inside one subset.
+
     Parameters:
         dataset: The complete dataset
-        train_ratio: Proportion of data for training
-        val_ratio: Proportion of data for validation
-        test_ratio: Proportion of data for testing
+        train_ratio: Proportion of samples for training
+        val_ratio: Proportion of samples for validation
+        test_ratio: Proportion of samples for testing
         random_seed: Random seed for reproducibility
-    
+
     Returns:
         train_set, val_set, test_set: Split datasets
     """
     # Ensure ratios sum to 1
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1"
-    
-    # Calculate sizes
-    total_size = len(dataset)
-    train_size = int(train_ratio * total_size)
-    val_size = int(val_ratio * total_size)
-    test_size = total_size - train_size - val_size
-    
-    # Split the dataset
-    train_set, val_set, test_set = random_split(
-        dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(random_seed)
-    )
-    
-    print(f"Dataset split: {train_size} training, {val_size} validation, {test_size} test samples")
-    return train_set, val_set, test_set
+
+    # Partition the samples, not the curves
+    sample_ids = sorted(set(dataset.samples))
+    total_samples = len(sample_ids)
+
+    if total_samples < 3:
+        raise ValueError(
+            f"Only {total_samples} sample(s) were detected, but a training/validation/test split "
+            f"needs at least 3. The sample of a curve is taken from the folder named in the "
+            f"'# Data from ...' header of the paired file, so check that the header is present and "
+            f"that its path ends with the sample folder rather than a shared sub-folder."
+        )
+
+    random.Random(random_seed).shuffle(sample_ids)
+
+    n_train = int(train_ratio * total_samples)
+    n_val = int(val_ratio * total_samples)
+
+    train_samples = set(sample_ids[:n_train])
+    val_samples = set(sample_ids[n_train:n_train + n_val])
+    test_samples = set(sample_ids[n_train + n_val:])
+
+    # Collect the curve indices belonging to each partition
+    train_idx = [i for i, s in enumerate(dataset.samples) if s in train_samples]
+    val_idx = [i for i, s in enumerate(dataset.samples) if s in val_samples]
+    test_idx = [i for i, s in enumerate(dataset.samples) if s in test_samples]
+
+    print(f"Sample split: {len(train_samples)} training, {len(val_samples)} validation, "
+          f"{len(test_samples)} test")
+    print(f"Curve split:  {len(train_idx)} training, {len(val_idx)} validation, "
+          f"{len(test_idx)} test")
+
+    return (Subset(dataset, train_idx),
+            Subset(dataset, val_idx),
+            Subset(dataset, test_idx))
 
 # Enhanced training function with flat region loss
 def train_model_v2(model, train_loader, val_loader, num_epochs=100, learning_rate=0.001, patience=10):
@@ -895,7 +953,9 @@ if __name__ == "__main__":
     dataset = CurveDataset(folder_path, use_log_coordinates=use_log_coordinates)
     
     # Create data splits
-    train_set, val_set, test_set = create_data_splits(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15)
+    train_set, val_set, test_set = create_data_splits(
+        dataset, train_ratio=0.70, val_ratio=0.15, test_ratio=0.15, random_seed=42
+    )
     
     # Create data loaders
     batch_size = 32  # Reduced batch size for better generalization
